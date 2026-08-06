@@ -1,0 +1,504 @@
+#!/usr/bin/env python3
+"""weatherfetch - a fastfetch-style weather report for your terminal.
+
+No API keys, no dependencies. Geolocation via IP (or pass a city name),
+weather via Open-Meteo.
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime
+
+REQUEST_TIMEOUT = 8
+USER_AGENT = {"User-Agent": "weatherfetch/1.0"}
+
+# ---------------------------------------------------------------- colors
+
+ANSI_PATTERN = re.compile(r"\x1b\[[0-9;]*m")
+
+
+class Palette:
+    """Truecolor palette. Neutralized to empty strings when color is off."""
+
+    reset = "\x1b[0m"
+    bold = "\x1b[1m"
+    dim = "\x1b[2m"
+
+    @staticmethod
+    def foreground(red, green, blue):
+        return f"\x1b[38;2;{red};{green};{blue}m"
+
+    accent = ""      # set at runtime from the weather condition
+    label = ""
+    value = ""
+    muted = ""
+
+
+COLOR_ENABLED = True
+
+
+def disable_color():
+    global COLOR_ENABLED
+    COLOR_ENABLED = False
+    Palette.reset = Palette.bold = Palette.dim = ""
+    Palette.foreground = staticmethod(lambda red, green, blue: "")
+
+
+def visible_width(text):
+    return len(ANSI_PATTERN.sub("", text))
+
+
+# ---------------------------------------------------------------- wmo codes
+
+# code -> (description, art key, accent as (red, green, blue))
+WEATHER_CODES = {
+    0:  ("Clear sky",           "sun",     (250, 204, 21)),
+    1:  ("Mainly clear",        "sun",     (250, 204, 21)),
+    2:  ("Partly cloudy",       "partly",  (148, 187, 233)),
+    3:  ("Overcast",            "cloud",   (156, 163, 175)),
+    45: ("Fog",                 "fog",     (148, 163, 184)),
+    48: ("Depositing rime fog", "fog",     (148, 163, 184)),
+    51: ("Light drizzle",       "rain",    (96, 165, 250)),
+    53: ("Moderate drizzle",    "rain",    (96, 165, 250)),
+    55: ("Dense drizzle",       "rain",    (96, 165, 250)),
+    56: ("Freezing drizzle",    "rain",    (125, 211, 252)),
+    57: ("Freezing drizzle",    "rain",    (125, 211, 252)),
+    61: ("Slight rain",         "rain",    (59, 130, 246)),
+    63: ("Moderate rain",       "rain",    (59, 130, 246)),
+    65: ("Heavy rain",          "rain",    (37, 99, 235)),
+    66: ("Freezing rain",       "rain",    (125, 211, 252)),
+    67: ("Heavy freezing rain", "rain",    (125, 211, 252)),
+    71: ("Slight snow",         "snow",    (224, 242, 254)),
+    73: ("Moderate snow",       "snow",    (224, 242, 254)),
+    75: ("Heavy snow",          "snow",    (224, 242, 254)),
+    77: ("Snow grains",         "snow",    (224, 242, 254)),
+    80: ("Slight showers",      "rain",    (59, 130, 246)),
+    81: ("Moderate showers",    "rain",    (59, 130, 246)),
+    82: ("Violent showers",     "rain",    (37, 99, 235)),
+    85: ("Slight snow showers", "snow",    (224, 242, 254)),
+    86: ("Heavy snow showers",  "snow",    (224, 242, 254)),
+    95: ("Thunderstorm",        "storm",   (167, 139, 250)),
+    96: ("Thunderstorm, hail",  "storm",   (167, 139, 250)),
+    99: ("Thunderstorm, hail",  "storm",   (167, 139, 250)),
+}
+
+GLYPHS = {
+    "sun": "☀", "moon": "☽", "partly": "⛅", "cloud": "☁",
+    "fog": "░", "rain": "☔", "snow": "❄", "storm": "⚡",
+}
+
+
+def describe(weather_code, is_daytime=True):
+    description, art_key, color = WEATHER_CODES.get(
+        weather_code, ("Unknown", "cloud", (156, 163, 175)))
+    if art_key == "sun" and not is_daytime:
+        return description.replace("Clear sky", "Clear night"), "moon", (203, 213, 225)
+    return description, art_key, color
+
+
+# ---------------------------------------------------------------- ascii art
+
+ASCII_ART = {
+    "sun": r"""
+        \   |   /
+          .-''-.
+   ---   /      \   ---
+        |        |
+   ---   \      /   ---
+          `-..-`
+        /   |   \
+""",
+    "moon": r"""
+         *      .
+           .-''-.
+      .   /      `.   *
+         |         )
+     *    \       /
+           `-...-`     .
+        .       *
+""",
+    "partly": r"""
+      \  |  /
+       .-''-.
+     -(      )-  .--.
+       `-..-`  .(    ).
+        (   .-(       ).
+         `-(            )-'
+            `--..____.--'
+""",
+    "cloud": r"""
+             .--.
+          .-(    ).
+       .-(         ).
+     -(               )-
+       `-(          )-'
+          `--..___.-'
+""",
+    "fog": r"""
+      _ - _ - _ - _ -
+    - _ - _ - _ - _ -
+      _ - _ - _ - _ -
+    - _ - _ - _ - _ -
+      _ - _ - _ - _ -
+    - _ - _ - _ - _ -
+""",
+    "rain": r"""
+             .--.
+          .-(    ).
+       .-(         ).
+     -(               )-
+       `-(          )-'
+          `--..___.-'
+        ' , ' , ' , ' ,
+       , ' , ' , ' , '
+""",
+    "snow": r"""
+             .--.
+          .-(    ).
+       .-(         ).
+     -(               )-
+       `-(          )-'
+          `--..___.-'
+         *   *   *   *
+       *   *   *   *
+""",
+    "storm": r"""
+             .--.
+          .-(    ).
+       .-(         ).
+     -(               )-
+       `-(          )-'
+          `--..___.-'
+          /_/  /_/
+           /    /
+""",
+}
+
+
+# ---------------------------------------------------------------- net
+
+def get_json(url):
+    request = urllib.request.Request(url, headers=USER_AGENT)
+    with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as response:
+        return json.load(response)
+
+
+def locate_by_ip():
+    """Try a couple of free IP-geolocation services."""
+    try:
+        location = get_json("https://ipapi.co/json/")
+        if location.get("latitude") is not None:
+            return (location["latitude"], location["longitude"],
+                    location.get("city") or "Unknown",
+                    location.get("country_name") or "")
+    except Exception:
+        pass
+    location = get_json("http://ip-api.com/json/")
+    if location.get("status") != "success":
+        raise RuntimeError("IP geolocation failed")
+    return (location["lat"], location["lon"],
+            location.get("city") or "Unknown", location.get("country") or "")
+
+
+# Letters with strokes/bars don't decompose under NFD, so map them by hand.
+STROKE_LETTERS = str.maketrans({"ł": "l", "Ł": "L", "ø": "o", "Ø": "O",
+                                "đ": "d", "Đ": "D", "ß": "ss", "æ": "ae",
+                                "œ": "oe"})
+
+
+def fold(text):
+    """Casefold and strip diacritics, so 'malmo' matches 'Malmö'."""
+    text = unicodedata.normalize("NFD", text.translate(STROKE_LETTERS))
+    return "".join(char for char in text
+                   if not unicodedata.combining(char)).lower().strip()
+
+
+def search_places(name, country_code=None):
+    params = {"name": name, "count": 20, "language": "en"}
+    if country_code:
+        params["countryCode"] = country_code
+    query_string = urllib.parse.urlencode(params)
+    url = f"https://geocoding-api.open-meteo.com/v1/search?{query_string}"
+    return get_json(url).get("results") or []
+
+
+def native_spellings(places, name):
+    """Accented spellings of `name` hiding in the results.
+
+    An ASCII query can miss the city entirely and match only, say, its airport
+    — but that record still names its district in the local script, which is
+    the spelling that does find the city.
+    """
+    target = fold(name)
+    spellings = []
+    for place in places:
+        for field in ("name", "admin3", "admin2", "admin1"):
+            candidate = (place.get(field) or "").strip()
+            if (candidate and fold(candidate) == target
+                    and candidate.lower() != name.lower()
+                    and candidate not in spellings):
+                spellings.append(candidate)
+    return spellings
+
+
+def geocode(query):
+    """Resolve a place name, optionally qualified as 'city, country'."""
+    name, _, country = query.partition(",")
+    name, country = name.strip(), country.strip()
+    if not name:
+        raise RuntimeError("empty location")
+
+    # The API filters server-side on a 2-letter code, which beats guessing.
+    country_code = (country.upper()
+                    if len(country) == 2 and country.isalpha() else None)
+    places = search_places(name, country_code)
+
+    # Retry under any local spelling the first pass revealed (malmo -> Malmö).
+    for spelling in native_spellings(places, name)[:2]:
+        known_ids = {place.get("id") for place in places}
+        places += [place for place in search_places(spelling, country_code)
+                   if place.get("id") not in known_ids]
+
+    if country and not country_code:
+        wanted_country = fold(country)
+        places = [place for place in places
+                  if fold(place.get("country", "")) == wanted_country]
+
+    if not places:
+        qualifier = f" in {country!r}" if country else ""
+        raise RuntimeError(f"no place found matching {name!r}{qualifier}")
+
+    # Rank populated places above airports and admin regions, then exact name,
+    # then size — the raw API order puts a 76-person hamlet above a city.
+    target = fold(name)
+    places.sort(reverse=True, key=lambda place: (
+        (place.get("feature_code") or "").startswith("PPL"),
+        fold(place.get("name", "")) == target,
+        place.get("population") or 0,
+    ))
+
+    best = places[0]
+    region = ", ".join(part for part in (best.get("admin1") or "",
+                                         best.get("country") or "") if part)
+    return best["latitude"], best["longitude"], best["name"], region
+
+
+def fetch_weather(latitude, longitude, units):
+    params = {
+        "latitude": latitude,
+        "longitude": longitude,
+        "current": ("temperature_2m,relative_humidity_2m,apparent_temperature,"
+                    "is_day,precipitation,weather_code,cloud_cover,pressure_msl,"
+                    "wind_speed_10m,wind_direction_10m,wind_gusts_10m"),
+        "daily": ("weather_code,temperature_2m_max,temperature_2m_min,sunrise,"
+                  "sunset,uv_index_max,precipitation_probability_max"),
+        "timezone": "auto",
+        "forecast_days": 4,
+    }
+    if units == "f":
+        params["temperature_unit"] = "fahrenheit"
+        params["wind_speed_unit"] = "mph"
+        params["precipitation_unit"] = "inch"
+    query_string = urllib.parse.urlencode(params)
+    return get_json(f"https://api.open-meteo.com/v1/forecast?{query_string}")
+
+
+# ---------------------------------------------------------------- formatting
+
+ARROWS = ["↓", "↙", "←", "↖", "↑", "↗", "→", "↘"]
+COMPASS_POINTS = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
+
+
+def compass(degrees):
+    """Compass point the wind comes from, and the arrow it blows toward."""
+    index = int((degrees % 360) / 45 + 0.5) % 8
+    return COMPASS_POINTS[index], ARROWS[index]
+
+
+def meter(fraction, width=10):
+    """A bar that still reads correctly with color stripped."""
+    fraction = max(0.0, min(1.0, fraction))
+    filled = int(round(fraction * width))
+    empty_char = "━" if COLOR_ENABLED else "╌"
+    return ("━" * filled + Palette.dim
+            + empty_char * (width - filled) + Palette.reset)
+
+
+def clock_time(timestamp):
+    try:
+        return datetime.fromisoformat(timestamp).strftime("%H:%M")
+    except Exception:
+        return timestamp[-5:]
+
+
+def day_label(timestamp, offset):
+    if offset == 0:
+        return "Today"
+    try:
+        return datetime.fromisoformat(timestamp).strftime("%a")
+    except Exception:
+        return timestamp
+
+
+def uv_word(uv_index):
+    for limit, word in ((3, "low"), (6, "moderate"), (8, "high"), (11, "very high")):
+        if uv_index < limit:
+            return word
+    return "extreme"
+
+
+# ---------------------------------------------------------------- report
+
+def build_rows(weather, place, region):
+    current = weather["current"]
+    units = weather["current_units"]
+    daily = weather["daily"]
+
+    description, art_key, color = describe(current["weather_code"],
+                                           bool(current["is_day"]))
+
+    Palette.accent = Palette.foreground(*color)
+    Palette.label = Palette.foreground(*color)
+    Palette.value = Palette.foreground(226, 232, 240)
+    Palette.muted = Palette.foreground(120, 130, 145)
+
+    degree_unit = units["temperature_2m"]
+    speed_unit = units["wind_speed_10m"].replace("mp/h", "mph")
+
+    title = f"{Palette.bold}{Palette.accent}{place}{Palette.reset}"
+    if region:
+        title += f"{Palette.muted}@{region}{Palette.reset}"
+
+    rows = [title, Palette.accent + "─" * visible_width(title) + Palette.reset]
+
+    def row(label, value):
+        rows.append(
+            f"{Palette.bold}{Palette.label}{label}{Palette.reset}"
+            f"{Palette.muted}: {Palette.reset}"
+            f"{Palette.value}{value}{Palette.reset}")
+
+    point, arrow = compass(current["wind_direction_10m"])
+    uv_index = daily["uv_index_max"][0]
+    rain_chance = daily["precipitation_probability_max"][0]
+
+    row("Condition", f"{GLYPHS.get(art_key, '')} {description}")
+    row("Temperature",
+        f"{current['temperature_2m']}{degree_unit}  {Palette.muted}"
+        f"(feels like {current['apparent_temperature']}{degree_unit})"
+        f"{Palette.reset}")
+    row("Today", f"{daily['temperature_2m_min'][0]}{degree_unit} → "
+                 f"{daily['temperature_2m_max'][0]}{degree_unit}")
+    row("Wind",
+        f"{arrow} {current['wind_speed_10m']} {speed_unit} {point}  "
+        f"{Palette.muted}(gusts {current['wind_gusts_10m']} {speed_unit})"
+        f"{Palette.reset}")
+    row("Humidity",
+        f"{current['relative_humidity_2m']}% {Palette.accent}"
+        f"{meter(current['relative_humidity_2m'] / 100)}{Palette.reset}")
+    row("Cloud cover",
+        f"{current['cloud_cover']}% {Palette.accent}"
+        f"{meter(current['cloud_cover'] / 100)}{Palette.reset}")
+    row("Precipitation",
+        f"{current['precipitation']}{units['precipitation']}  "
+        f"{Palette.muted}({rain_chance}% chance today){Palette.reset}")
+    row("Pressure", f"{round(current['pressure_msl'])} {units['pressure_msl']}")
+    row("UV index", f"{uv_index:.1f} {Palette.muted}({uv_word(uv_index)})"
+                    f"{Palette.reset}")
+    row("Sun", f"↑ {clock_time(daily['sunrise'][0])}   "
+               f"↓ {clock_time(daily['sunset'][0])}")
+
+    rows.append("")
+    forecast_cells = []
+    for day_index in range(1, min(4, len(daily["time"]))):
+        _, day_art, _ = describe(daily["weather_code"][day_index], True)
+        forecast_cells.append(
+            f"{Palette.bold}{Palette.label}"
+            f"{day_label(daily['time'][day_index], day_index):>4}"
+            f"{Palette.reset} {GLYPHS.get(day_art, ' ')} {Palette.value}"
+            f"{round(daily['temperature_2m_min'][day_index]):>3}/"
+            f"{round(daily['temperature_2m_max'][day_index]):<3}{Palette.reset}")
+    if forecast_cells:
+        separator = f"{Palette.muted}│{Palette.reset} "
+        rows.append(f"{Palette.muted}Forecast{Palette.reset}  "
+                    + separator.join(forecast_cells))
+
+    rows.append("")
+    rows.append("".join(f"\x1b[4{shade}m   " for shade in range(8)) + Palette.reset)
+    rows.append("".join(f"\x1b[10{shade}m   " for shade in range(8)) + Palette.reset)
+
+    return art_key, color, rows
+
+
+def render(art_key, color, rows, gap=3):
+    art_lines = ASCII_ART[art_key].strip("\n").split("\n")
+    art_width = max((len(line) for line in art_lines), default=0)
+
+    padding = max(0, (len(rows) - len(art_lines)) // 2)
+    art_lines = [""] * padding + art_lines
+
+    art_color = Palette.foreground(*color)
+    output = []
+    for line_index in range(max(len(art_lines), len(rows))):
+        left = art_lines[line_index] if line_index < len(art_lines) else ""
+        right = rows[line_index] if line_index < len(rows) else ""
+        left_cell = (f"{art_color}{left}{Palette.reset}"
+                     + " " * (art_width - len(left) + gap))
+        output.append((left_cell + right).rstrip())
+    return "\n".join(output)
+
+
+# ---------------------------------------------------------------- cli
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="weatherfetch",
+        description="fastfetch-style weather report for your terminal.")
+    parser.add_argument("location", nargs="*", metavar="CITY[, COUNTRY]",
+                        help="place to look up, e.g. 'warsaw, poland' or "
+                             "'warsaw, pl' (default: locate by IP)")
+    parser.add_argument("-u", "--units", choices=["c", "f"], default=None,
+                        help="temperature units "
+                             "(default: celsius, or $WEATHERFETCH_UNITS)")
+    parser.add_argument("-n", "--no-color", action="store_true",
+                        help="disable color")
+    args = parser.parse_args()
+
+    units = args.units or os.environ.get("WEATHERFETCH_UNITS", "c").lower()
+    if units not in ("c", "f"):
+        units = "c"
+
+    if args.no_color or os.environ.get("NO_COLOR") or not sys.stdout.isatty():
+        disable_color()
+
+    try:
+        if args.location:
+            latitude, longitude, place, region = geocode(" ".join(args.location))
+        else:
+            latitude, longitude, place, region = locate_by_ip()
+        weather = fetch_weather(latitude, longitude, units)
+    except urllib.error.URLError as error:
+        print(f"weatherfetch: network error: {error.reason}", file=sys.stderr)
+        return 1
+    except Exception as error:
+        print(f"weatherfetch: {error}", file=sys.stderr)
+        return 1
+
+    art_key, color, rows = build_rows(weather, place, region)
+    print()
+    print(render(art_key, color, rows))
+    print()
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
